@@ -113,14 +113,24 @@ state with `disconnected = await request.is_disconnected()`.
 
 Request files are normally sent as multipart form data (`multipart/form-data`).
 
-Signature: `request.form(max_files=1000, max_fields=1000, max_part_size=1024*1024)`
+Signature: `request.form(max_files=1000, max_fields=1000, max_part_size=1024*1024, max_file_size=None, max_total_size=None)`
 
-You can configure the number of maximum fields or files with the parameters `max_files` and `max_fields`; and part size using `max_part_size`:
+You can configure the number of maximum fields or files with the parameters `max_files` and `max_fields`; part size using `max_part_size`;
+the maximum size of a single uploaded file with `max_file_size`; and the maximum combined size of all uploaded content
+(files and regular form fields) with `max_total_size`:
 
 ```python
-async with request.form(max_files=1000, max_fields=1000, max_part_size=1024*1024):
+async with request.form(max_files=1000, max_fields=1000, max_part_size=1024*1024, max_file_size=1024*1024, max_total_size=1024*1024*10):
     ...
 ```
+
+`max_file_size` and `max_total_size` are given in bytes. They must be `0` or a positive integer, and default to `None`,
+which means no limit is enforced. A value of `0` only allows empty content. The limits are checked while the request body
+is being received, and parsing stops as soon as a limit is exceeded. When a size limit is exceeded, a
+`413 Payload Too Large` error is raised, indicating whether a single file or the total upload size exceeded its limit.
+
+The same parameters are accepted by `starlette.formparsers.MultiPartParser` when using the parser directly
+(`max_total_size` is also accepted by `starlette.formparsers.FormParser` for urlencoded forms).
 
 !!! info
     These limits are for security reasons, allowing an unlimited number of fields or files could lead to a denial of service attack by consuming a lot of CPU and memory parsing too many empty fields.
