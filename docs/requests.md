@@ -113,14 +113,22 @@ state with `disconnected = await request.is_disconnected()`.
 
 Request files are normally sent as multipart form data (`multipart/form-data`).
 
-Signature: `request.form(max_files=1000, max_fields=1000, max_part_size=1024*1024)`
+Signature: `request.form(max_files=1000, max_fields=1000, max_part_size=1024*1024, max_file_size=None, max_total_size=None)`
 
 You can configure the number of maximum fields or files with the parameters `max_files` and `max_fields`; and part size using `max_part_size`:
 
 ```python
-async with request.form(max_files=1000, max_fields=1000, max_part_size=1024*1024):
+async with request.form(max_files=1000, max_fields=1000, max_part_size=1024*1024, max_file_size=1024*1024, max_total_size=10*1024*1024):
     ...
 ```
+
+You can also limit the size of individual uploaded files with `max_file_size`, and the combined size of all
+uploaded content (files and regular form fields) with `max_total_size`. Both are expressed in bytes, must be
+non-negative integers (`0` means only empty content is allowed), and default to `None`, which means no limit.
+The limits are enforced while the request body is being streamed: as soon as a limit is exceeded, parsing stops
+and an `HTTPException` with status code `413` is raised, indicating whether a single file or the total upload
+size exceeded its limit. Invalid values (e.g. negative numbers or non-integers) raise a `ValueError` before any
+content is consumed.
 
 !!! info
     These limits are for security reasons, allowing an unlimited number of fields or files could lead to a denial of service attack by consuming a lot of CPU and memory parsing too many empty fields.

@@ -10,12 +10,13 @@ from tempfile import SpooledTemporaryFile
 from typing import Any, ClassVar
 from unittest import mock
 
+import anyio
 import pytest
 
 from starlette.applications import Starlette
-from starlette.datastructures import UploadFile
+from starlette.datastructures import Headers, UploadFile
 from starlette.formparsers import MultiPartException, MultiPartParser, _user_safe_decode
-from starlette.requests import Request
+from starlette.requests import ClientDisconnect, Request
 from starlette.responses import JSONResponse
 from starlette.routing import Mount
 from starlette.types import ASGIApp, Receive, Scope, Send
@@ -129,6 +130,29 @@ def make_app_max_parts(max_files: int = 1000, max_fields: int = 1000, max_part_s
     async def app(scope: Scope, receive: Receive, send: Send) -> None:
         request = Request(scope, receive)
         data = await request.form(max_files=max_files, max_fields=max_fields, max_part_size=max_part_size)
+        output: dict[str, Any] = {}
+        for key, value in data.items():
+            if isinstance(value, UploadFile):
+                content = await value.read()
+                output[key] = {
+                    "filename": value.filename,
+                    "size": value.size,
+                    "content": content.decode(),
+                    "content_type": value.content_type,
+                }
+            else:
+                output[key] = value
+        await request.close()
+        response = JSONResponse(output)
+        await response(scope, receive, send)
+
+    return app
+
+
+def make_app_max_sizes(max_file_size: int | None = None, max_total_size: int | None = None) -> ASGIApp:
+    async def app(scope: Scope, receive: Receive, send: Send) -> None:
+        request = Request(scope, receive)
+        data = await request.form(max_file_size=max_file_size, max_total_size=max_total_size)
         output: dict[str, Any] = {}
         for key, value in data.items():
             if isinstance(value, UploadFile):
@@ -838,3 +862,204 @@ def test_multipart_closes_tempfile_on_oserror(
         client.post("/", content=content, headers=headers)
 
     assert close_called
+
+
+def _multipart_body(boundary: str, parts: list[tuple[str, str | None, bytes]]) -> bytes:
+    """Build a multipart body from (name, filename, content) parts."""
+    chunks: list[bytes] = []
+    for name, filename, content in parts:
+        disposition = f'Content-Disposition: form-data; name="{name}"'
+        if filename is not None:
+            disposition += f'; filename="{filename}"'
+        chunks.append(f"--{boundary}\r\n{disposition}\r\n\r\n".encode())
+        chunks.append(content)
+        chunks.append(b"\r\n")
+    chunks.append(f"--{boundary}--\r\n".encode())
+    return b"".join(chunks)
+
+
+def test_max_file_size_exceeded_returns_413(test_client_factory: TestClientFactory) -> None:
+    client = test_client_factory(Starlette(routes=[Mount("/", app=make_app_max_sizes(max_file_size=10))]))
+    boundary = "boundary"
+    content = _multipart_body(boundary, [("file", "test.txt", b"01234567890")])
+    response = client.post("/", content=content, headers={"Content-Type": f"multipart/form-data; boundary={boundary}"})
+    assert response.status_code == 413
+    assert response.text == "File size exceeded the maximum allowed size of 10 bytes."
+
+
+def test_max_file_size_exactly_at_limit_passes(test_client_factory: TestClientFactory) -> None:
+    client = test_client_factory(make_app_max_sizes(max_file_size=10))
+    boundary = "boundary"
+    content = _multipart_body(boundary, [("file", "test.txt", b"0123456789")])
+    response = client.post("/", content=content, headers={"Content-Type": f"multipart/form-data; boundary={boundary}"})
+    assert response.status_code == 200
+    assert response.json()["file"]["size"] == 10
+
+
+def test_max_file_size_zero_allows_only_empty_files(test_client_factory: TestClientFactory) -> None:
+    client = test_client_factory(Starlette(routes=[Mount("/", app=make_app_max_sizes(max_file_size=0))]))
+    boundary = "boundary"
+    content = _multipart_body(boundary, [("file", "test.txt", b"")])
+    response = client.post("/", content=content, headers={"Content-Type": f"multipart/form-data; boundary={boundary}"})
+    assert response.status_code == 200
+
+    content = _multipart_body(boundary, [("file", "test.txt", b"x")])
+    response = client.post("/", content=content, headers={"Content-Type": f"multipart/form-data; boundary={boundary}"})
+    assert response.status_code == 413
+    assert response.text == "File size exceeded the maximum allowed size of 0 bytes."
+
+
+def test_max_total_size_counts_files_and_fields(test_client_factory: TestClientFactory) -> None:
+    client = test_client_factory(Starlette(routes=[Mount("/", app=make_app_max_sizes(max_total_size=20))]))
+    boundary = "boundary"
+    content = _multipart_body(
+        boundary,
+        [
+            ("field", None, b"0123456789"),  # 10 bytes of field content
+            ("file", "test.txt", b"01234567890"),  # 11 bytes of file content, 21 in total
+        ],
+    )
+    response = client.post("/", content=content, headers={"Content-Type": f"multipart/form-data; boundary={boundary}"})
+    assert response.status_code == 413
+    assert response.text == "Total upload size exceeded the maximum allowed size of 20 bytes."
+
+
+def test_max_total_size_exactly_at_limit_passes(test_client_factory: TestClientFactory) -> None:
+    client = test_client_factory(make_app_max_sizes(max_total_size=20))
+    boundary = "boundary"
+    content = _multipart_body(
+        boundary,
+        [
+            ("field", None, b"0123456789"),
+            ("file", "test.txt", b"0123456789"),
+        ],
+    )
+    response = client.post("/", content=content, headers={"Content-Type": f"multipart/form-data; boundary={boundary}"})
+    assert response.status_code == 200
+    assert response.json() == {
+        "field": "0123456789",
+        "file": {"filename": "test.txt", "size": 10, "content": "0123456789", "content_type": None},
+    }
+
+
+@pytest.mark.parametrize("invalid_limit", [-1, 1.5, "10", True])
+def test_invalid_size_limits_raise_value_error_early(
+    invalid_limit: Any, test_client_factory: TestClientFactory
+) -> None:
+    async def error_app(scope: Scope, receive: Receive, send: Send) -> None:
+        request = Request(scope, receive)
+        await request.form(max_file_size=invalid_limit, max_total_size=invalid_limit)
+
+    client = test_client_factory(error_app)
+    boundary = "boundary"
+    content = _multipart_body(boundary, [("file", "test.txt", b"data")])
+    with pytest.raises(ValueError, match="must be a non-negative integer or None"):
+        client.post("/", content=content, headers={"Content-Type": f"multipart/form-data; boundary={boundary}"})
+
+
+def test_max_file_size_with_parser_used_directly() -> None:
+    boundary = "boundary"
+    content = _multipart_body(boundary, [("file", "test.txt", b"01234567890")])
+    headers = Headers({"Content-Type": f"multipart/form-data; boundary={boundary}"})
+
+    async def stream() -> Any:
+        yield content
+
+    parser = MultiPartParser(headers, stream(), max_file_size=10)
+    with pytest.raises(MultiPartException, match="File size exceeded the maximum allowed size of 10 bytes."):
+        anyio.run(parser.parse)
+
+
+def test_max_total_size_with_parser_used_directly() -> None:
+    boundary = "boundary"
+    content = _multipart_body(boundary, [("field", None, b"0123456789"), ("file", "test.txt", b"0123456789")])
+    headers = Headers({"Content-Type": f"multipart/form-data; boundary={boundary}"})
+
+    async def stream() -> Any:
+        yield content
+
+    parser = MultiPartParser(headers, stream(), max_total_size=15)
+    with pytest.raises(MultiPartException, match="Total upload size exceeded the maximum allowed size of 15 bytes."):
+        anyio.run(parser.parse)
+
+
+@pytest.mark.parametrize("invalid_limit", [-1, 2.5, "1", False])
+def test_parser_invalid_size_limits_raise_value_error(invalid_limit: Any) -> None:
+    headers = Headers({"Content-Type": "multipart/form-data; boundary=boundary"})
+
+    async def stream() -> Any:
+        yield b""
+
+    with pytest.raises(ValueError, match="must be a non-negative integer or None"):
+        MultiPartParser(headers, stream(), max_file_size=invalid_limit)
+    with pytest.raises(ValueError, match="must be a non-negative integer or None"):
+        MultiPartParser(headers, stream(), max_total_size=invalid_limit)
+
+
+def test_multipart_closes_tempfiles_on_size_limit_error(test_client_factory: TestClientFactory) -> None:
+    """Finished and in-progress temporary files must be closed when a size limit is exceeded."""
+    closed_files: list[SpooledTemporaryFile[bytes]] = []
+    open_files: list[SpooledTemporaryFile[bytes]] = []
+
+    class TrackingSpooledTemporaryFile(SpooledTemporaryFile[bytes]):
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            super().__init__(*args, **kwargs)
+            open_files.append(self)
+
+        def close(self) -> None:
+            closed_files.append(self)
+            super().close()
+
+    async def error_app(scope: Scope, receive: Receive, send: Send) -> None:
+        request = Request(scope, receive)
+        with mock.patch("starlette.formparsers.SpooledTemporaryFile", TrackingSpooledTemporaryFile):
+            await request.form(max_file_size=5)
+
+    client = test_client_factory(error_app)
+    boundary = "boundary"
+    content = _multipart_body(
+        boundary,
+        [
+            ("file1", "a.txt", b"12345"),  # finished before the limit is hit
+            ("file2", "b.txt", b"123456"),  # exceeds max_file_size mid-upload
+        ],
+    )
+    headers = {"Content-Type": f"multipart/form-data; boundary={boundary}"}
+
+    with pytest.raises(MultiPartException, match="File size exceeded"):
+        client.post("/", content=content, headers=headers)
+
+    assert len(open_files) == 2
+    assert sorted(id(file) for file in closed_files) == sorted(id(file) for file in open_files)
+
+
+def test_multipart_closes_tempfiles_on_client_disconnect(test_client_factory: TestClientFactory) -> None:
+    """Temporary files must be closed when the client disconnects mid-upload."""
+    closed_files: list[SpooledTemporaryFile[bytes]] = []
+    open_files: list[SpooledTemporaryFile[bytes]] = []
+
+    class TrackingSpooledTemporaryFile(SpooledTemporaryFile[bytes]):
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            super().__init__(*args, **kwargs)
+            open_files.append(self)
+
+        def close(self) -> None:
+            closed_files.append(self)
+            super().close()
+
+    async def disconnecting_stream() -> Any:
+        yield b'--boundary\r\nContent-Disposition: form-data; name="file"; filename="a.txt"\r\n\r\npartial'
+        raise ClientDisconnect()
+
+    async def error_app(scope: Scope, receive: Receive, send: Send) -> None:
+        headers = Headers({"Content-Type": "multipart/form-data; boundary=boundary"})
+        parser = MultiPartParser(headers, disconnecting_stream())
+        with mock.patch("starlette.formparsers.SpooledTemporaryFile", TrackingSpooledTemporaryFile):
+            await parser.parse()
+
+    client = test_client_factory(error_app)
+    with pytest.raises(ClientDisconnect):
+        client.post("/", content=b"", headers={"Content-Type": "multipart/form-data; boundary=boundary"})
+
+    assert len(open_files) == 1
+    assert sorted(id(file) for file in closed_files) == sorted(id(file) for file in open_files)
